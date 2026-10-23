@@ -1,18 +1,21 @@
 'use strict';
 /* ===========================================================================
    Headset mode — Meta Quest and other WebXR headsets.
-   Virtual reality draws the whole night around you. Mixed reality lays the sky over the
-   headset's camera view of the real world, so you can see where the stars are even when
-   cloud covers them. Headsets carry no compass, so the player shows it where north is.
+   Virtual reality draws the whole night around you. Mixed reality draws only the stars, lines
+   and names over the headset's camera view, so the real world stays in full view and each
+   drawn star sits on the real one, even when it is too faint or clouded to see.
+   Headsets carry no compass, so the player shows it where north is; where the headset can
+   pin that to the room, it is remembered for next time.
    =========================================================================== */
 
 const XR = {
   active: false, preview: false, session: null, mode: 'vr', refSpace: null,
   supportVR: false, supportAR: false, blocked: null, headsetUA: false,
-  theta: 0, calibHow: null, calibPending: null, calibObj: null, calibNote: '',
-  screen: 'calib', labels: true, lines: true, art: true, voice: true, below: false, dim: 0, mrLimit: 4.8,
+  theta: 0, calibHow: null, calibPending: null, calibObj: null, calibNote: '', calibChanged: false,
+  samples: [], tuned: false, drag: null, still: null, anchor: null, wantAnchor: false, restoring: false, anchorSaved: false,
+  screen: 'calib', labels: true, lines: true, art: true, voice: true, below: false, boost: 1.45, mrLimit: 4.8,
   info: null, hoverBtn: null, dirty: true, lastT: 0, lastPanel: 0, lastPlanets: 0, lastSpoken: '',
-  needPanel: true, primary: 'right', gazeId: null, gazeT0: 0, stillT0: 0, stillYaw: null, saved: null, figKey: '', focusKey: ''
+  needPanel: true, primary: 'right', gazeId: null, gazeT0: 0, saved: null, figKey: '', focusKey: ''
 };
 const THREE_URL = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
 const R_SKY = 100;
@@ -62,12 +65,12 @@ function openXrChooser() {
     ? 'This headset can do VR, but this page is embedded somewhere that is not allowed to start it. Open Star Hop from its own web address and these buttons will work.'
     : 'No VR headset found here. Open this page in the Meta Quest Browser — or another WebXR browser — to step inside.';
   p.innerHTML = `<div class="pophead"><b>Headset</b><button class="x" id="xp-x" aria-label="Close">×</button></div>
-    ${can ? `<p>Step inside the sky. Your headset does not know where north is, so first you will show it: face a direction you know, or — in mixed reality — point at the real Moon.</p>` : `<p class="vrwarn">${blockedMsg}</p>`}
+    ${can ? `<p>Step inside the sky. Your headset does not know where north is, so first you will show it: face a direction you know, or — in mixed reality — look at the real Moon. It remembers for next time in the same spot.</p>` : `<p class="vrwarn">${blockedMsg}</p>`}
     <div class="xrmodes">
       <button class="xrmode" id="xp-vr" ${XR.supportVR ? '' : 'disabled'}><b>Virtual reality</b>
         <span>The whole night sky around you, ground below your feet. Learn anywhere, any time of day.</span></button>
       <button class="xrmode" id="xp-ar" ${XR.supportAR ? '' : 'disabled'}><b>Mixed reality</b>
-        <span>Star positions drawn over the real world through the headset’s cameras — you see where they are even behind cloud. Go outside or face a window.</span></button>
+        <span>Only the stars, lines and names, drawn on top of the real sky through the headset’s cameras — the rest of the world stays in view. Go outside or face a window.</span></button>
     </div>
     <button class="btn" id="xp-preview" style="width:100%;margin-top:12px">Preview the headset view on this screen</button>
     <p class="fine">In the headset: point a controller and pull the trigger to pick a star or press a button. Squeeze the grip to bring the menu to you. Hand tracking works too — pinch to select.</p>`;
@@ -83,7 +86,7 @@ function enterXR(mode) {
   if (!navigator.xr) return;
   let sp;
   // Must be requested inside the tap itself.
-  try { sp = navigator.xr.requestSession(mode === 'ar' ? 'immersive-ar' : 'immersive-vr', { optionalFeatures: ['local-floor', 'hand-tracking'] }); }
+  try { sp = navigator.xr.requestSession(mode === 'ar' ? 'immersive-ar' : 'immersive-vr', { optionalFeatures: ['local-floor', 'hand-tracking', 'anchors'] }); }
   catch (e) { toast('The headset would not start: ' + (e.message || e)); return; }
   $('xrpanel').hidden = true;
   Promise.all([sp, loadThree(), fontsReady()])
@@ -95,7 +98,10 @@ function beginCommon(mode) {
   XR.saved = { atm: S.layers.atmosphere };
   S.layers.atmosphere = false;                  // a teaching sky: show the stars even by day
   if (!S.lesson && !S.tour && !S.drill) goLive(true);
-  XR.theta = 0; XR.calibHow = null; XR.calibPending = null; XR.calibObj = null; XR.calibNote = '';
+  XR.theta = 0; XR.calibHow = null; XR.calibPending = null; XR.calibObj = null; XR.calibNote = ''; XR.calibChanged = false;
+  XR.samples = []; XR.tuned = false; XR.drag = null; XR.still = null;
+  XR.anchor = null; XR.wantAnchor = false; XR.restoring = false; XR.anchorSaved = false;
+  XR.art = mode !== 'ar';                       // mixed reality starts with just stars and lines; the drawings are a tap away
   XR.screen = 'calib'; XR.info = null; XR.needPanel = true; XR.dirty = true; XR.lastT = 0; XR.lastSpoken = '';
   buildScene();
   applyMode();
@@ -107,13 +113,16 @@ async function startSession(session, mode) {
   R3.xr.setReferenceSpaceType('local');
   await R3.xr.setSession(session);
   XR.refSpace = R3.xr.getReferenceSpace();
+  XR.refSpace.addEventListener('reset', onRecenter);
   session.addEventListener('end', endXR);
   R3.setAnimationLoop(xrLoop);
-  xrSpeak(mode === 'ar' ? 'Mixed reality. First, show me where north is.' : 'Welcome to the sky. First, show me where north is.');
+  const remembering = restoreNorth(session);
+  xrSpeak(remembering ? 'Welcome back. Checking for the north you set last time.'
+    : mode === 'ar' ? 'Mixed reality. First, show me where north is.' : 'Welcome to the sky. First, show me where north is.');
 }
 function endXR() {
   if (!XR.active) return;
-  XR.active = false; XR.session = null;
+  XR.active = false; XR.session = null; XR.anchor = null; XR.wantAnchor = false; XR.restoring = false; XR.drag = null;
   if (R3) R3.setAnimationLoop(null);
   if (XR.preview) { XR.preview = false; document.body.classList.remove('xrpreview'); }
   if (XR.saved) S.layers.atmosphere = XR.saved.atm;
@@ -188,12 +197,41 @@ function arrowTexture() {
   g.fillStyle = '#f4b942'; g.beginPath(); g.moveTo(112, 64); g.lineTo(28, 20); g.lineTo(48, 64); g.lineTo(28, 108); g.closePath(); g.fill();
   return canvasTex(cv);
 }
+function reticleTexture() {                                   // a sight: put the real Moon in the middle
+  const cv = makeCanvas(128, 128), g = cv.getContext('2d');
+  g.strokeStyle = '#5ed39b'; g.lineWidth = 4; g.lineCap = 'round';
+  g.beginPath(); g.arc(64, 64, 34, 0, TAU); g.stroke();
+  for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { g.beginPath(); g.moveTo(64 + dx * 42, 64 + dy * 42); g.lineTo(64 + dx * 60, 64 + dy * 60); g.stroke(); }
+  return canvasTex(cv);
+}
 const enuToLocal = (e, r) => new THREE.Vector3(e[0] * r, e[2] * r, -e[1] * r);   // East, Up, -North
+// Light laid on top. The headset blends this picture over its camera view by alpha, so the alpha
+// has to stay where the light is: plain additive blending sets it to 1 wherever anything is drawn,
+// and in mixed reality every constellation drawing became an opaque black card across the sky.
+// src is SrcAlphaFactor for straight colour, OneFactor for a shader that premultiplies its own.
+const lightBlend = src => ({ blending: THREE.CustomBlending, blendSrc: src, blendDst: THREE.OneFactor,
+  blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.OneMinusSrcAlphaFactor });
 
+// Air bends starlight near the horizon and lifts it — half a degree right at the horizon — the same
+// correction the flat sky makes, so drawn stars sit on the real ones even low down.
+const LIFT = `
+  vec4 lifted(vec3 p) {
+    vec4 w = modelMatrix * vec4(p, 1.0);
+    vec3 o = (modelMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz, d = w.xyz - o;
+    float r = length(d), s = d.y / r;
+    if (s < 0.16 && s > -0.05) {
+      float alt = degrees(asin(s));
+      float na = radians(alt + 1.02 / tan(radians(alt + 10.3 / (alt + 5.11))) / 60.0);
+      vec2 h = normalize(d.xz) * cos(na);
+      d = vec3(h.x, sin(na), h.y) * r;
+    }
+    return vec4(o + d, 1.0);
+  }`;
 const STAR_VS = `
   attribute vec3 color; attribute float mag;
   uniform float uLimit; uniform float uScale; uniform float uBelow; uniform float uBoost;
   varying vec3 vColor; varying float vAlpha;
+  ${LIFT}
   void main() {
     vec3 dir = normalize((modelMatrix * vec4(position, 0.0)).xyz);
     float over = uLimit - mag;
@@ -203,7 +241,7 @@ const STAR_VS = `
     a = min(1.0, a * uBoost);
     vAlpha = a; vColor = color;
     gl_PointSize = clamp((1.3 + max(over, 0.0) * 1.15) * uScale * (0.85 + 0.15 * uBoost), 1.0, 18.0);
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * viewMatrix * lifted(position);
   }`;
 const STAR_FS = `
   varying vec3 vColor; varying float vAlpha;
@@ -217,10 +255,11 @@ const STAR_FS = `
 const LINE_VS = `
   uniform float uBelow;
   varying float vUp;
+  ${LIFT}
   void main() {
     vec3 dir = normalize((modelMatrix * vec4(position, 0.0)).xyz);
     vUp = max(smoothstep(-0.03, 0.01, dir.y), uBelow * 0.45);
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * viewMatrix * lifted(position);
   }`;
 const LINE_FS = `
   uniform vec3 uColor; uniform float uOpacity;
@@ -266,13 +305,10 @@ function buildScene() {
   SC.add(CAM);
 
   G.world = new T.Group(); SC.add(G.world);                // East-Up-(-North), turned by the calibration
-  G.cel = new T.Group(); G.cel.matrixAutoUpdate = false; G.world.add(G.cel);   // J2000 sky
 
   // VR backdrop and ground; hidden in mixed reality, where the real world shows through
   G.bg = new T.Mesh(new T.SphereGeometry(400, 32, 16), new T.MeshBasicMaterial({ color: 0x04060d, side: T.BackSide, depthWrite: false }));
   G.bg.renderOrder = -10; G.world.add(G.bg);
-  G.dim = new T.Mesh(new T.SphereGeometry(390, 32, 16), new T.MeshBasicMaterial({ color: 0x000000, side: T.BackSide, transparent: true, opacity: 0, depthWrite: false }));
-  G.dim.renderOrder = -9; G.world.add(G.dim);
   G.ground = new T.Mesh(new T.SphereGeometry(94, 48, 16, 0, TAU, Math.PI / 2, Math.PI / 2),
     new T.MeshBasicMaterial({ color: 0x05070c, side: T.BackSide }));
   G.world.add(G.ground);
@@ -280,13 +316,18 @@ function buildScene() {
   const rg = new T.BufferGeometry(); rg.setAttribute('position', new T.Float32BufferAttribute(ring, 3));
   G.horizon = new T.Line(rg, new T.LineBasicMaterial({ color: 0x8ca5d7, transparent: true, opacity: 0.45 }));
   G.world.add(G.horizon);
+  // Everything that depends on where north is. Hidden while you show the headset north, so a
+  // misplaced "N" or Moon can't be mistaken for the real thing.
+  G.sky = new T.Group(); G.world.add(G.sky);
+  G.compass = [];
   COMPASS.forEach((c, i) => {
     if (i % 2) return;
     const major = i % 4 === 0, az = i * 22.5 * D2R;
     const sp = textSprite(c, { color: c === 'N' ? '#ff7a5c' : major ? '#eef2fb' : '#9aa7c4', h: major ? 3.2 : 2.2, weight: 700 });
     sp.position.set(Math.sin(az) * 90, 90 * Math.sin(2.2 * D2R), -Math.cos(az) * 90);
-    G.world.add(sp);
+    sp.userData = { major }; G.sky.add(sp); G.compass.push(sp);
   });
+  G.cel = new T.Group(); G.cel.matrixAutoUpdate = false; G.sky.add(G.cel);   // J2000 sky
 
   // stars
   const pos = [], col = [], mag = [];
@@ -297,7 +338,7 @@ function buildScene() {
   sg.setAttribute('mag', new T.Float32BufferAttribute(mag, 1));
   G.starMat = new T.ShaderMaterial({
     uniforms: { uLimit: { value: 5.5 }, uScale: { value: 1.6 }, uBelow: { value: 0 }, uBoost: { value: 1 } },
-    vertexShader: STAR_VS, fragmentShader: STAR_FS, transparent: true, depthWrite: false, blending: T.AdditiveBlending
+    vertexShader: STAR_VS, fragmentShader: STAR_FS, transparent: true, depthWrite: false, ...lightBlend(T.SrcAlphaFactor)
   });
   G.stars = new T.Points(sg, G.starMat); G.stars.frustumCulled = false; G.cel.add(G.stars);
 
@@ -309,7 +350,7 @@ function buildScene() {
   mg.setAttribute('wgt', new T.Float32BufferAttribute(mw, 1));
   mg.setAttribute('sz', new T.Float32BufferAttribute(ms, 1));
   G.mwMat = new T.ShaderMaterial({ uniforms: { uScale: { value: 1 }, uOn: { value: 1 } }, vertexShader: MW_VS, fragmentShader: MW_FS,
-    transparent: true, depthWrite: false, blending: T.AdditiveBlending });
+    transparent: true, depthWrite: false, ...lightBlend(T.SrcAlphaFactor) });
   G.mw = new T.Points(mg, G.mwMat); G.mw.frustumCulled = false; G.cel.add(G.mw);
 
   // constellation figures, and a second layer for whatever is being taught
@@ -330,8 +371,9 @@ function buildScene() {
     const vs = `varying vec2 vUv; varying float vUp; uniform float uBelow;
       void main(){ vUv = uv; vec3 d = normalize((modelMatrix * vec4(position, 0.0)).xyz);
         vUp = max(smoothstep(-0.03, 0.01, d.y), uBelow * 0.45); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`;
+    // premultiplied, with alpha only where the drawing has ink: the black around it stays see-through
     const fs = `uniform sampler2D map; uniform float uOpacity; varying vec2 vUv; varying float vUp;
-      void main(){ vec3 c = texture2D(map, vUv).rgb; gl_FragColor = vec4(c * uOpacity * vUp, 1.0); }`;
+      void main(){ vec3 c = texture2D(map, vUv).rgb * uOpacity * vUp; gl_FragColor = vec4(c, max(c.r, max(c.g, c.b))); }`;
     for (const a of ARTS) {
       const V = a.v.map(v => new T.Vector3(v[0], v[1], v[2]));
       const c = V[0].clone().add(V[1]).add(V[2]).normalize();
@@ -359,7 +401,7 @@ function buildScene() {
       // The drawings are grey, so one byte a pixel is enough: a quarter of the headset's graphics memory.
       const tex = loader.load(a.file, t => { t.format = T.LuminanceFormat; t.needsUpdate = true; });
       const mat = new T.ShaderMaterial({ uniforms: { map: { value: tex }, uOpacity: { value: 0.2 }, uBelow: { value: 0 } },
-        vertexShader: vs, fragmentShader: fs, transparent: true, depthWrite: false, blending: T.AdditiveBlending, side: T.DoubleSide });
+        vertexShader: vs, fragmentShader: fs, transparent: true, depthWrite: false, ...lightBlend(T.OneFactor), side: T.DoubleSide });
       const mesh = new T.Mesh(geo, mat); mesh.userData = { con: a.con, c: [c.x, c.y, c.z], rad };   // culled when out of view
       G.cel.add(mesh); G.art.push(mesh);
     }
@@ -376,7 +418,7 @@ function buildScene() {
   G.dsoSprites = [];
   const glow = glowTexture();
   for (const o of DSOS) {
-    const g = new T.Sprite(new T.SpriteMaterial({ map: glow, color: 0xb9adff, transparent: true, opacity: 0.55, depthWrite: false, blending: T.AdditiveBlending }));
+    const g = new T.Sprite(new T.SpriteMaterial({ map: glow, color: 0xb9adff, transparent: true, opacity: 0.55, depthWrite: false, ...lightBlend(T.SrcAlphaFactor) }));
     g.scale.set(2.4, 2.4, 1); g.position.set(o.vec[0] * 98, o.vec[1] * 98, o.vec[2] * 98);
     const l = textSprite(o.name, { h: 1.5, left: true, color: '#b7abff', weight: 500 });
     l.position.copy(g.position);
@@ -384,7 +426,7 @@ function buildScene() {
   }
   // planets, Moon, Sun
   G.planets = PLANETS.filter(p => p.n).map(p => {
-    const dot = new T.Sprite(new T.SpriteMaterial({ map: glow, color: new T.Color(p.col), transparent: true, depthWrite: false, blending: T.AdditiveBlending }));
+    const dot = new T.Sprite(new T.SpriteMaterial({ map: glow, color: new T.Color(p.col), transparent: true, depthWrite: false, ...lightBlend(T.SrcAlphaFactor) }));
     dot.scale.set(1.5, 1.5, 1);
     const l = textSprite(p.n, { h: 1.8, left: true, color: '#ffe6bd', weight: 600 });
     G.cel.add(dot); G.cel.add(l);
@@ -392,22 +434,28 @@ function buildScene() {
   });
   G.moonCv = makeCanvas(128, 128); G.moonTex = canvasTex(G.moonCv);
   G.moon = new T.Sprite(new T.SpriteMaterial({ map: G.moonTex, transparent: true, depthWrite: false }));
-  G.world.add(G.moon);
-  G.moonLabel = textSprite('Moon', { h: 1.8, left: true, color: '#eee8d6' }); G.world.add(G.moonLabel);
-  G.sun = new T.Sprite(new T.SpriteMaterial({ map: glow, color: 0xfff1cc, transparent: true, depthWrite: false, blending: T.AdditiveBlending }));
-  G.sun.scale.set(9, 9, 1); G.world.add(G.sun);
+  G.sky.add(G.moon);
+  // in mixed reality a ring marks where the Moon should be, so you see the real one inside it
+  G.moonRing = new T.Sprite(new T.SpriteMaterial({ map: ringTexture('#eee8d6', 4), transparent: true, depthWrite: false })); G.sky.add(G.moonRing);
+  G.moonLabel = textSprite('Moon', { h: 1.8, left: true, color: '#eee8d6' }); G.sky.add(G.moonLabel);
+  G.moonLabel.center.x = -0.06 - 1.5 / G.moonLabel.scale.x;          // clear of the disc and the ring
+  G.sun = new T.Sprite(new T.SpriteMaterial({ map: glow, color: 0xfff1cc, transparent: true, depthWrite: false, ...lightBlend(T.SrcAlphaFactor) }));
+  G.sun.scale.set(9, 9, 1); G.sky.add(G.sun);
 
   // markers
   const amber = ringTexture('#f4b942', 7), white = ringTexture('#eef2fb', 5), green = ringTexture('#5ed39b', 7);
-  G.marks = Array.from({ length: 8 }, () => { const m = new T.Sprite(new T.SpriteMaterial({ map: amber, transparent: true, depthWrite: false, depthTest: false })); m.visible = false; G.world.add(m); return m; });
-  G.guide = new T.Sprite(new T.SpriteMaterial({ map: green, transparent: true, depthWrite: false, depthTest: false })); G.guide.visible = false; G.world.add(G.guide);
-  G.hover = new T.Sprite(new T.SpriteMaterial({ map: white, transparent: true, depthWrite: false, depthTest: false })); G.hover.visible = false; G.world.add(G.hover);
+  G.marks = Array.from({ length: 8 }, () => { const m = new T.Sprite(new T.SpriteMaterial({ map: amber, transparent: true, depthWrite: false, depthTest: false })); m.visible = false; G.sky.add(m); return m; });
+  G.guide = new T.Sprite(new T.SpriteMaterial({ map: green, transparent: true, depthWrite: false, depthTest: false })); G.guide.visible = false; G.sky.add(G.guide);
+  G.hover = new T.Sprite(new T.SpriteMaterial({ map: white, transparent: true, depthWrite: false, depthTest: false })); G.hover.visible = false; G.sky.add(G.hover);
   G.figLabel = null;
 
   // head-locked guide arrow
   G.head = new T.Group(); SC.add(G.head);
   G.chev = new T.Sprite(new T.SpriteMaterial({ map: arrowTexture(), transparent: true, depthTest: false, depthWrite: false }));
   G.chev.scale.set(0.09, 0.09, 1); G.chev.visible = false; G.head.add(G.chev);
+  // the sight for showing it north with the real Moon: far off, so both eyes see it single
+  G.reticle = new T.Sprite(new T.SpriteMaterial({ map: reticleTexture(), transparent: true, depthTest: false, depthWrite: false }));
+  G.reticle.position.set(0, 0, -20); G.reticle.scale.set(2, 2, 1); G.reticle.renderOrder = 22; G.reticle.visible = false; G.head.add(G.reticle);
 
   // the menu panel
   G.pcv = makeCanvas(PW, PH); G.pctx = G.pcv.getContext('2d'); G.ptex = canvasTex(G.pcv);
@@ -425,7 +473,9 @@ function buildScene() {
     c.userData = { ray, src: null, hoverBtn: null, hoverObj: null };
     c.addEventListener('connected', e => { c.userData.src = e.data; c.visible = e.data.targetRayMode !== 'gaze'; });
     c.addEventListener('disconnected', () => { c.userData.src = null; c.visible = false; });
+    c.addEventListener('selectstart', () => onSelectStart(c.userData));
     c.addEventListener('select', () => onSelect(c.userData));
+    c.addEventListener('selectend', () => { if (XR.drag && XR.drag.p === c.userData) XR.drag = null; });
     c.addEventListener('squeeze', () => { XR.needPanel = true; });
     c.visible = false; SC.add(c);
     return c;
@@ -445,11 +495,12 @@ function buildScene() {
   el.addEventListener('pointerup', () => { if (PV.drag && PV.drag.moved < 5 && XR.pointers && XR.pointers[0]) onSelect(XR.pointers[0]); PV.drag = null; });
   el.addEventListener('wheel', e => { e.preventDefault(); CAM.fov = clamp(CAM.fov * (1 + Math.sign(e.deltaY) * 0.1), 20, 100); CAM.updateProjectionMatrix(); }, { passive: false });
 }
+// Mixed reality draws only what belongs on the sky: no backdrop, ground, horizon ring, Milky Way
+// haze or Sun glow — the real ones are right there — and just the four main compass letters.
 function applyMode() {
   const ar = XR.mode === 'ar';
-  G.bg.visible = !ar; G.ground.visible = !ar; G.mw.visible = !ar;
-  G.dim.visible = ar;
-  G.starMat.uniforms.uBoost.value = ar ? 1.45 : 1;
+  G.bg.visible = !ar; G.ground.visible = !ar; G.mw.visible = !ar; G.horizon.visible = !ar;
+  for (const sp of G.compass) sp.visible = !ar || sp.userData.major;
   G.lineMat.uniforms.uOpacity.value = ar ? 0.6 : 0.34;
   XR.dirty = true;
 }
@@ -480,6 +531,7 @@ function xrLoop(time, frame) {
     G.head.position.copy(CAM.position); G.head.quaternion.copy(CAM.quaternion);
   }
   G.head.updateMatrixWorld(true);
+  if (frame) { if (XR.wantAnchor) saveNorth(frame); followAnchor(frame); }
   if (XR.needPanel) placePanel();
   followPanel(now);
   updateSky(now);
@@ -516,9 +568,11 @@ function updateSky(now) {
   G.cel.matrixWorldNeedsUpdate = true;
   G.world.position.copy(G.head.position);
   G.world.rotation.y = XR.theta * D2R;
+  G.sky.visible = !aiming();
+  G.reticle.visible = !!XR.calibObj;
   const limit = ar ? XR.mrLimit : Math.max(SKY.limit, 3.5);
   const u = G.starMat.uniforms;
-  u.uLimit.value = limit; u.uBelow.value = XR.below ? 1 : 0;
+  u.uLimit.value = limit; u.uBelow.value = XR.below ? 1 : 0; u.uBoost.value = ar ? XR.boost : 1;
   u.uScale.value = XR.preview ? (devicePixelRatio || 1) * 1.1 : 1.7;
   G.mwMat.uniforms.uScale.value = XR.preview ? (devicePixelRatio || 1) : 1.6;
   G.lineMat.uniforms.uBelow.value = G.focusMat.uniforms.uBelow.value = XR.below ? 1 : 0;
@@ -530,7 +584,6 @@ function updateSky(now) {
     m.material.uniforms.uOpacity.value = on ? 0.45 : S.focusFigs ? 0.05 : ar ? 0.26 : 0.13;
     m.material.uniforms.uBelow.value = XR.below ? 1 : 0;
   }
-  G.dim.material.opacity = ar ? XR.dim : 0;
   const hide = S.hideLabels || !XR.labels;
   const up = v => { const e = apply3(SKY.enuStar, v); return e[2] > -0.005 || XR.below; };
   for (const sp of G.starLabels) { const s = sp.userData.star; sp.visible = !hide && s.mag < limit - 0.2 && up(s.vec); }
@@ -545,13 +598,14 @@ function updateSky(now) {
     }
     drawMoonPhase();
   }
-  const me = apply3(SKY.E, SKY.moon.v), mv = enuToLocal(me, 92);
-  G.moon.position.copy(mv); G.moonLabel.position.copy(mv);
+  const me = apply3(SKY.E, SKY.moon.v), mv = enuToLocal(refract(me), 92);
+  G.moon.position.copy(mv); G.moonLabel.position.copy(mv); G.moonRing.position.copy(mv);
   const ms = SKY.moon.semi * 2 * D2R * 92 * 1.6;
-  G.moon.scale.set(ms, ms, 1);
-  G.moon.visible = me[2] > -0.01 || XR.below; G.moonLabel.visible = G.moon.visible && !hide;
+  G.moon.scale.set(ms, ms, 1); G.moonRing.scale.set(ms * 1.9, ms * 1.9, 1);
+  const moonUp = me[2] > -0.01 || XR.below;
+  G.moon.visible = moonUp && !ar; G.moonRing.visible = moonUp && ar; G.moonLabel.visible = moonUp && !hide;
   const se = apply3(SKY.E, SKY.sun.v);
-  G.sun.position.copy(enuToLocal(se, 91)); G.sun.visible = se[2] > -0.01;
+  G.sun.position.copy(enuToLocal(se, 91)); G.sun.visible = se[2] > -0.01 && !ar;
   // rotate the Moon's lit side toward the Sun, as seen from the head
   const inv = G.head.quaternion.clone().invert();
   const mw = enuToLocal(me, 1).applyAxisAngle(new THREE.Vector3(0, 1, 0), XR.theta * D2R).applyQuaternion(inv);
@@ -601,8 +655,8 @@ function updateFocusLines() {
   const figShown = gazeFig && XR.labels ? gazeFig : null, fk = figShown ? figShown.con : '';
   if (fk !== XR.figKey) {
     XR.figKey = fk;
-    if (G.figLabel) { G.world.remove(G.figLabel); G.figLabel = null; }
-    if (figShown) { G.figLabel = textSprite(`${figShown.name} — ${figShown.nick.replace(/^The /, 'the ')}`, { h: 2.6, color: '#f4c766', weight: 600 }); G.world.add(G.figLabel); }
+    if (G.figLabel) { G.sky.remove(G.figLabel); G.figLabel = null; }
+    if (figShown) { G.figLabel = textSprite(`${figShown.name} — ${figShown.nick.replace(/^The /, 'the ')}`, { h: 2.6, color: '#f4c766', weight: 600 }); G.sky.add(G.figLabel); }
   }
   if (G.figLabel && figShown) {
     let c = [0, 0, 0];
@@ -647,11 +701,19 @@ function updatePointers(dt) {
       pointers.push(c.userData);
       // thumbstick nudges the sky while calibrating
       const gp = src.gamepad;
-      if (gp && gp.axes && XR.screen === 'calib' && !XR.calibPending) {
+      if (gp && gp.axes && XR.screen === 'calib' && !aiming() && !XR.drag) {
         const x = gp.axes.length >= 4 ? gp.axes[2] : gp.axes[0];
         // curved response: a light push creeps (≈1°/s) for exact alignment, a full push sweeps (20°/s)
-        if (Math.abs(x) > 0.12) { XR.theta = norm180(XR.theta - Math.sign(x) * x * x * 20 * dt); XR.calibHow = XR.calibHow || 'Adjusted by hand'; XR.dirty = true; }
+        if (Math.abs(x) > 0.12) { XR.theta = norm180(XR.theta - Math.sign(x) * x * x * 20 * dt); markTuned(); }
       }
+    }
+    // Grabbing the sky: while the trigger or pinch is held, the sky turns with your hand, so you
+    // can drag a drawn star straight onto the real one.
+    const dg = XR.drag;
+    if (dg && dg.p.dir) {
+      const dy = norm180(yawOf(dg.p.dir) - dg.yaw0);
+      dg.moved = Math.max(dg.moved, Math.abs(dy));
+      if (dg.moved > 0.4) { XR.theta = norm180(dg.theta0 - dy); markTuned(); }
     }
   } else if (XR.preview) {
     if (!XR.pvPointer) XR.pvPointer = {};
@@ -670,7 +732,7 @@ function updatePointers(dt) {
   pointers.forEach((p, i) => {
     G.ray.set(p.origin, p.dir);
     const hit = G.ray.intersectObject(G.panel, false)[0];
-    p.hoverBtn = null; p.hoverObj = null;
+    p.hoverBtn = null; p.hoverObj = null; p.onPanel = !!hit;
     if (hit && hit.uv) {
       const x = hit.uv.x * PW, y = (1 - hit.uv.y) * PH;
       const b = PBTN.find(b => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h);
@@ -679,7 +741,7 @@ function updatePointers(dt) {
       cur.visible = true; cur.position.copy(hit.point); cur.quaternion.copy(G.panel.quaternion); cur.material.opacity = i ? 0.4 : 1;
       if (p.ctrl) p.ctrl.userData.ray.scale.z = hit.distance;
     } else {
-      p.hoverObj = skyPick(p.dir); hoverObj = hoverObj || p.hoverObj;
+      p.hoverObj = aiming() ? null : skyPick(p.dir); hoverObj = hoverObj || p.hoverObj;
       if (p.ctrl) p.ctrl.userData.ray.scale.z = 6;
     }
     if (p.ctrl) p.ctrl.userData.ray.material.opacity = i ? 0.3 : 0.75;
@@ -687,15 +749,17 @@ function updatePointers(dt) {
   // no controllers or hands: look at something and hold still
   if (!pointers.length && XR.session) {
     const f = headForward(), now = performance.now();
-    const o = skyPick(f);
+    const o = aiming() ? null : skyPick(f);
     if (o && XR.gazeId === o.id) { if (now - XR.gazeT0 > 1300 && XR.gazeFired !== o.id) { XR.gazeFired = o.id; selectObj(o); } }
     else { XR.gazeId = o ? o.id : null; XR.gazeT0 = now; XR.gazeFired = null; }
     hoverObj = o;
-    // hands-free calibration: hold still facing the direction for three seconds
-    if (XR.calibPending) {
-      const y = yawOf(f);
-      if (XR.stillYaw == null || Math.abs(norm180(y - XR.stillYaw)) > 3) { XR.stillYaw = y; XR.stillT0 = now; }
-      else if (now - XR.stillT0 > 3000) finishFacing();
+    // hands-free calibration: hold still for three seconds — facing the direction, or with the real
+    // Moon in the sight (only counted while looking up about as high as it really is)
+    if (aiming()) {
+      const y = yawOf(f), pt = Math.asin(clamp(f.y, -1, 1)) * R2D, tol = XR.calibObj ? 1 : 3;
+      if (XR.calibObj && Math.abs(pt - XR.calibObj.alt) > 10) XR.still = null;
+      else if (!XR.still || Math.abs(norm180(y - XR.still.y)) > tol || Math.abs(pt - XR.still.p) > tol) XR.still = { y, p: pt, t0: now };
+      else if (now - XR.still.t0 > 3000) { XR.still = null; if (XR.calibPending) finishFacing(); else finishObject(); }
     }
   }
   if (hoverBtn !== XR.hoverBtn) { XR.hoverBtn = hoverBtn; XR.dirty = true; }
@@ -703,11 +767,16 @@ function updatePointers(dt) {
   G.hover.visible = !!hoverObj && !S.hideLabels;
   if (hoverObj) { const e = enuOf(hoverObj); G.hover.position.copy(enuToLocal(e, 90)); G.hover.scale.set(2.6, 2.6, 1); }
 }
+function onSelectStart(p) {
+  if (XR.screen !== 'calib' || aiming() || p.onPanel || !p.dir) return;
+  XR.drag = { p, yaw0: yawOf(p.dir), theta0: XR.theta, moved: 0 };
+}
 function onSelect(p) {
   if (p.hand && p.hand !== XR.primary) { XR.primary = p.hand; XR.dirty = true; }
+  if (XR.drag && XR.drag.p === p && XR.drag.moved > 0.4) return;          // that was a drag, not a click
   if (p.hoverBtn) { pressButton(p.hoverBtn, p); return; }
   if (XR.calibPending) { finishFacing(); return; }
-  if (XR.calibObj) { finishObject(p); return; }
+  if (XR.calibObj) { finishObject(); return; }
   const o = p.hoverObj || (p.dir ? skyPick(p.dir) : null);
   if (o) selectObj(o);
 }
@@ -738,14 +807,37 @@ function xrMissHint(o, targets) {
   return `The one you want is ${best.d.toFixed(0)}° away — ${handWords(best.d)} ${way}.`;
 }
 
-/* ---------- calibration ---------- */
-function startFacing(name, az) { XR.calibPending = { name, az }; XR.calibObj = null; XR.stillYaw = null; XR.dirty = true;
-  xrSpeak(`Turn to face ${name}, then pull the trigger.`); }
+/* ---------- calibration ----------
+   Three steps, coarse to exact: face a direction you know (or, by day, along your shadow); then
+   look at the real Moon or a bright planet through a sight in the middle of your view — each one
+   you add is averaged in, and they cross-check each other; then grab the sky and drag a drawn star
+   onto the real one. Only the compass direction needs setting: the headset already knows "up". */
+const aiming = () => !!(XR.calibPending || XR.calibObj);
+const capFirst = t => t.charAt(0).toUpperCase() + t.slice(1);
+const listNames = a => a.length < 2 ? a.join('') : a.slice(0, -1).join(', ') + ' and ' + a[a.length - 1];
+function startFacing(name, az, how) {
+  XR.calibPending = { name, az, how: how || `Turn your body to face ${name}.` };
+  XR.calibObj = null; XR.still = null; XR.restoring = false; XR.calibNote = ''; XR.dirty = true;
+  xrSpeak(XR.calibPending.how.replace(/\.$/, ', then pull the trigger.'));
+}
 function finishFacing() {
   const c = XR.calibPending; if (!c) return;
   XR.theta = norm180(c.az - yawOf(headForward()));
-  XR.calibHow = `Set by facing ${c.name}`; XR.calibPending = null; XR.calibNote = ''; XR.dirty = true;
-  xrSpeak(`North is set. You are facing ${c.name.toLowerCase()}.`);
+  XR.calibHow = c.name === 'shadow' ? 'Set from your shadow' : `Set by facing ${c.name}`;
+  XR.samples = []; XR.tuned = false; XR.calibPending = null; XR.calibNote = ''; XR.calibChanged = true; XR.dirty = true;
+  xrSpeak(c.name === 'shadow' ? 'North is set from your shadow.' : `North is set. You are facing ${c.name.toLowerCase()}.`);
+}
+function shadowAz() {                    // your shadow points straight away from the Sun
+  return atNow(() => { const s = altazVec(SKY.sun.v, true); return s.alt > 4 && s.alt < 65 ? norm360(s.az + 180) : null; });
+}
+function markTuned() {
+  if (!XR.calibHow) XR.calibHow = 'Set by hand'; else if (XR.calibHow !== 'Set by hand') XR.tuned = true;
+  XR.calibChanged = true; XR.restoring = false; XR.dirty = true;
+}
+function calibDone() {
+  if (XR.calibChanged && XR.calibHow) { dropAnchor(); XR.wantAnchor = !!XR.session; XR.anchorSaved = false; XR.restoring = false; }
+  XR.calibChanged = false; XR.calibPending = null; XR.calibObj = null; XR.drag = null;
+  XR.screen = 'main'; XR.needPanel = true;
 }
 // Aiming at a real object has to use the real sky — here, this minute — even when the app is
 // showing another time or place for a lesson or the tour.
@@ -756,36 +848,140 @@ function atNow(fn) {
   try { return fn(); } finally { S.time = t; S.place = pl; solve(); }
 }
 const theName = c => c.o.kind === 'moon' ? 'the Moon' : c.name;
-function startObject(o, name) { XR.calibObj = { o, name }; XR.calibPending = null; XR.dirty = true;
-  xrSpeak(`Aim at the real ${name} and pull the trigger.`); }
-function finishObject(p) {
-  const c = XR.calibObj; if (!c || !p.dir) return;
-  const e = atNow(() => enuOf(c.o)), A = Math.atan2(e[0], e[1]) * R2D, altO = Math.asin(clamp(e[2], -1, 1)) * R2D;
-  const d = p.dir.clone().normalize(), altR = Math.asin(clamp(d.y, -1, 1)) * R2D;
-  XR.theta = norm180(A - yawOf(d));
-  XR.calibHow = `Aligned on ${theName(c)}`; XR.calibObj = null;
-  XR.calibNote = Math.abs(altR - altO) > 12
-    ? `You aimed ${Math.round(Math.abs(altR - altO))}° ${altR > altO ? 'higher' : 'lower'} than where ${theName(c)} should be — check it was the right object.` : '';
-  XR.dirty = true;
-  xrSpeak(`Aligned on ${theName(c)}.`);
+function startObject(o, name) {
+  const e = atNow(() => enuOf(o));
+  XR.calibObj = { o, name, alt: Math.asin(clamp(refract(e)[2], -1, 1)) * R2D, az: norm360(Math.atan2(e[0], e[1]) * R2D) };
+  XR.calibPending = null; XR.still = null; XR.restoring = false; XR.calibNote = ''; XR.dirty = true;
+  xrSpeak(`Look straight at the real ${name}. Put it in the middle of the green circle, then pull the trigger.`);
+}
+function meanOff(list) {                 // weighted average of directions, safe across ±180°
+  let x = 0, y = 0;
+  for (const s of list) { x += s.w * Math.cos(s.off * D2R); y += s.w * Math.sin(s.off * D2R); }
+  return norm180(Math.atan2(y, x) * R2D);
+}
+// The sight is fixed in the middle of your view, so where your head points is where you looked —
+// steadier than aiming a controller, and the same for hands and controllers.
+function finishObject() {
+  const c = XR.calibObj; if (!c) return;
+  const e = atNow(() => enuOf(c.o)), A = Math.atan2(e[0], e[1]) * R2D;
+  const altO = Math.asin(clamp(refract(e)[2], -1, 1)) * R2D;
+  const d = headForward(), altR = Math.asin(clamp(d.y, -1, 1)) * R2D, miss = altR - altO;
+  if (Math.abs(miss) > 10) {             // the headset knows "up" exactly, so a height this far off means the wrong object
+    XR.calibNote = `You looked ${Math.round(Math.abs(miss))}° ${miss > 0 ? 'higher' : 'lower'} than ${theName(c)} should be, so that was something else — try again. If you are sure it was ${theName(c)}, check Star Hop's location is where you are.`;
+    XR.still = null; XR.dirty = true;
+    xrSpeak(`That is not where ${theName(c)} should be. Try again.`);
+    return;
+  }
+  // high in the sky, a small slip of the head swings the compass direction a long way, so it counts for less
+  const s = { label: theName(c), off: norm180(A - yawOf(d)), w: Math.cos(altO * D2R) ** 2 };
+  const others = XR.samples.filter(k => k.label !== s.label);
+  const gap = others.length ? Math.abs(norm180(s.off - meanOff(others))) : 0;
+  XR.calibObj = null; XR.dirty = true;
+  if (gap > 6 && others.length > 1) {    // two or more that agree outvote the odd one out
+    XR.calibNote = `${capFirst(s.label)} came out ${Math.round(gap)}° away from ${listNames(others.map(k => k.label))}, which agree — that was probably not ${s.label}, so it is left out.`;
+    xrSpeak(`That was probably not ${s.label}, so I left it out.`);
+    return;
+  }
+  XR.calibNote = gap > 6 ? `${capFirst(s.label)} and ${others[0].label} disagree by ${Math.round(gap)}° — one of them was probably the wrong object. Using ${s.label}; line up on a third to be sure.` : '';
+  XR.samples = gap > 6 ? [s] : [...others, s];
+  XR.theta = meanOff(XR.samples);
+  let spread = 0;
+  for (const a of XR.samples) for (const b of XR.samples) spread = Math.max(spread, Math.abs(norm180(a.off - b.off)));
+  const names = listNames(XR.samples.map(k => k.label));
+  XR.calibHow = XR.samples.length > 1 ? `Aligned on ${names} — they agree within ${spread.toFixed(1)}°` : `Aligned on ${names}`;
+  XR.tuned = false; XR.calibChanged = true;
+  xrSpeak(`Aligned on ${names}.` + (c.o.kind === 'moon' ? ' The ring should now sit on the real Moon.' : ''));
 }
 function calibCandidates() {
   return atNow(() => {
     const out = [], sun = SKY.sunAlt;
+    // Nothing near the top of the sky: there, a small slip of the head swings the direction a long way.
+    const ok = (pp, lo) => pp.alt > lo && pp.alt < 70;
     const m = altazVec(SKY.moon.v, true);
-    if (m.alt > 3) out.push({ o: { id: 'moon', kind: 'moon', name: 'The Moon' }, name: 'Moon', pos: m });
+    if (ok(m, 3)) out.push({ o: { id: 'moon', kind: 'moon', name: 'The Moon' }, name: 'Moon', pos: m, mag: -12 });
     // By day only the Moon shows; planets come out in twilight, the brightest stars a little later.
-    if (sun < -4) for (const q of SKY.planets) { if (q.mag > 0.5) continue; const pp = altazVec(q.v, false); if (pp.alt > 5) out.push({ o: q.obj || { id: 'planet-' + q.p.k, kind: 'planet', name: q.p.n, q }, name: q.p.n, pos: pp }); }
-    if (sun < -8) for (const s of STARS) { if (s.mag > 0.9) continue; const pp = altazVec(s.vec, false); if (pp.alt > 8) out.push({ o: s, name: s.name, pos: pp }); }
-    return out.slice(0, 3);
+    if (sun < -4) for (const q of SKY.planets) { if (q.mag > 0.5) continue; const pp = altazVec(q.v, false); if (ok(pp, 5)) out.push({ o: q.obj || { id: 'planet-' + q.p.k, kind: 'planet', name: q.p.n, q }, name: q.p.n, pos: pp, mag: q.mag }); }
+    if (sun < -8) for (const s of STARS) { if (s.mag > 0.9) continue; const pp = altazVec(s.vec, false); if (ok(pp, 8)) out.push({ o: s, name: s.name, pos: pp, mag: s.mag }); }
+    return out.sort((a, b) => a.mag - b.mag).slice(0, 3);        // brightest first: the easiest to see through the cameras
   });
+}
+
+/* ---------- remembering north ----------
+   Where the headset supports spatial anchors, north is pinned to the room: an anchor whose forward
+   axis points at true north. It stays put when the headset recentres or its tracking drifts, and a
+   saved one brings north back next time you start in the same spot. */
+const NORTH_KEY = 'starhop.xrNorth';
+function dropAnchor() { if (XR.anchor) { try { XR.anchor.delete(); } catch (e) {} XR.anchor = null; } }
+function saveNorth(frame) {
+  XR.wantAnchor = false;
+  if (!frame.createAnchor || typeof XRRigidTransform === 'undefined') return;
+  const a = XR.theta * D2R / 2, h = G.head.position, session = XR.session;
+  let p;
+  try { p = frame.createAnchor(new XRRigidTransform({ x: h.x, y: h.y, z: h.z }, { x: 0, y: Math.sin(a), z: 0, w: Math.cos(a) }), XR.refSpace); } catch (e) { return; }
+  Promise.resolve(p).then(anchor => {
+    if (!anchor) return;
+    if (XR.session !== session || XR.wantAnchor) { try { anchor.delete(); } catch (e) {} return; }   // superseded
+    dropAnchor(); XR.anchor = anchor;
+    if (!anchor.requestPersistentHandle) return;
+    const keep = tries => anchor.requestPersistentHandle().then(id => {
+      let old = null;
+      try { old = localStorage.getItem(NORTH_KEY); localStorage.setItem(NORTH_KEY, id); } catch (e) {}
+      if (old && old !== id && session.deletePersistentAnchor) session.deletePersistentAnchor(old).catch(() => {});
+      XR.anchorSaved = true; XR.dirty = true;
+    }).catch(() => { if (tries) setTimeout(() => { if (XR.anchor === anchor) keep(tries - 1); }, 1500); });
+    keep(2);
+  }).catch(() => {});
+}
+function restoreNorth(session) {
+  let id = null;
+  try { id = localStorage.getItem(NORTH_KEY); } catch (e) {}
+  if (!id || !session.restorePersistentAnchor) return false;
+  XR.restoring = true; XR.dirty = true;
+  let p;
+  try { p = session.restorePersistentAnchor(id); } catch (e) { XR.restoring = false; return false; }
+  Promise.resolve(p).then(a => {
+    if (XR.session === session && XR.restoring && !XR.anchor) XR.anchor = a; else try { a.delete(); } catch (e) {}
+  }).catch(() => { if (XR.session === session) { XR.restoring = false; XR.dirty = true; } });
+  // somewhere new, the saved anchor is never found: stop waiting and calibrate as usual
+  setTimeout(() => { if (XR.session === session && XR.restoring) { XR.restoring = false; XR.dirty = true; } }, 8000);
+  return true;
+}
+function followAnchor(frame) {
+  const a = XR.anchor;
+  if (!a || (XR.screen === 'calib' && !XR.restoring)) return;      // while north is being set by hand, the hand wins
+  let pose = null;
+  try { if (!frame.trackedAnchors || frame.trackedAnchors.has(a)) pose = frame.getPose(a.anchorSpace, XR.refSpace); } catch (e) {}
+  if (!pose) return;
+  const q = pose.transform.orientation;
+  XR.theta = norm180(-yawOf(new THREE.Vector3(0, 0, -1).applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w))));
+  if (XR.restoring || !XR.calibHow) {
+    XR.restoring = false; XR.calibHow = 'Remembered from last time'; XR.samples = []; XR.tuned = false;
+    XR.calibChanged = false; XR.anchorSaved = true; XR.dirty = true;
+    xrSpeak(XR.screen === 'calib' ? 'North is remembered from last time. Check the sky lines up, then press Done.' : 'North is remembered from last time.');
+  }
+}
+// Recentring the headset (holding the Meta button) moves its idea of "straight ahead". If the
+// browser says by how much, north turns to match; an anchor puts it right by itself; failing
+// both, north has to be shown again.
+function onRecenter(e) {
+  const t = e && e.transform;
+  if (t) {
+    const q = t.orientation, dy = yawOf(new THREE.Vector3(0, 0, -1).applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w)));
+    XR.theta = norm180(XR.theta + dy);
+    for (const s of XR.samples) s.off = norm180(s.off + dy);
+  } else if (!XR.anchor && XR.calibHow) {
+    XR.calibHow = null; XR.samples = []; XR.tuned = false; XR.screen = 'calib';
+    XR.calibNote = 'The headset was recentred, so north was lost — please show it again.';
+    xrSpeak('The headset was recentred. Show me north again.');
+  }
+  XR.drag = null; XR.needPanel = true; XR.dirty = true;
 }
 
 /* ---------- guidance ---------- */
 function updateGuide() {
   const g = typeof guideTarget === 'function' ? guideTarget() : null;
   G.guide.visible = false; G.chev.visible = false; XR.guideText = '';
-  if (!g) return;
+  if (!g || aiming()) return;
   const e = g.enu, alt = Math.asin(clamp(e[2], -1, 1)) * R2D, az = norm360(Math.atan2(e[0], e[1]) * R2D);
   G.guide.visible = true; G.guide.position.copy(enuToLocal(e, 89));
   const s = 4.2 + Math.sin(tClock * 3) * 0.6; G.guide.scale.set(s, s, 1);
@@ -875,35 +1071,50 @@ function drawPanel() {
   G.ptex.needsUpdate = true;
 }
 function panelCalib() {
-  const g = G.pctx;
+  const ar = XR.mode === 'ar';
   ptext('Where is north?', 40, 160, PF(700, 40), '#ffffff');
-  ptext(XR.calibHow ? '✓ ' + XR.calibHow : 'Not set yet — for now the sky assumes you started facing north.', 40, 200, PF(500, 22), XR.calibHow ? '#5ed39b' : '#9aa7c4');
+  const status = XR.calibHow ? '✓ ' + XR.calibHow + (XR.tuned ? ' · fine-tuned by hand' : '') + (XR.anchorSaved && !XR.calibChanged ? ' · saved for next time' : '')
+    : XR.restoring ? 'Looking for the north you set here last time…' : 'Not set yet — for now the sky assumes you started facing north.';
+  pwrap(status, PW - 80, PF(500, 22), 1).forEach(l => ptext(l, 40, 200, PF(500, 22), XR.calibHow ? '#5ed39b' : '#9aa7c4'));
   if (XR.calibNote) pwrap(XR.calibNote, PW - 80, PF(500, 20), 2).forEach((l, i) => ptext(l, 40, 232 + i * 26, PF(500, 20), '#f0883e'));
-  if (XR.calibPending || XR.calibObj) {
-    const name = XR.calibPending ? XR.calibPending.name : XR.calibObj.name;
-    const line = XR.calibPending ? `Turn your body to face ${name}.` : `Aim your controller at the real ${name}.`;
-    ptext(line, PW / 2, 330, PF(700, 38), '#f4b942', 'center');
-    ptext(XR.calibPending ? 'Then pull the trigger — or pinch, or just hold still for three seconds.' : 'Then pull the trigger.', PW / 2, 380, PF(500, 24), '#dfe5f3', 'center');
-    pbtn('cancel', 'Cancel', PW / 2 - 110, 470, 220, 70, { act: () => { XR.calibPending = null; XR.calibObj = null; } });
-    return;
+  const cancel = () => pbtn('cancel', 'Cancel', PW / 2 - 110, 530, 220, 66, { act: () => { XR.calibPending = null; XR.calibObj = null; XR.still = null; } });
+  if (XR.calibPending) {
+    pwrap(XR.calibPending.how, PW - 80, PF(700, 34), 2).forEach((l, i) => ptext(l, PW / 2, 330 + i * 44, PF(700, 34), '#f4b942', 'center'));
+    ptext('Look straight ahead, then pull the trigger — or pinch, or hold still for three seconds.', PW / 2, 440, PF(500, 22), '#dfe5f3', 'center');
+    cancel(); return;
   }
-  let y = 262;
-  ptext('1   FACE A DIRECTION YOU KNOW', 40, y, PF(700, 18), '#8190b0');
-  [['North', 0], ['East', 90], ['South', 180], ['West', 270]].forEach(([n, a], i) =>
-    pbtn('face-' + n, n, 40 + i * 240, y + 16, 220, 66, { act: () => startFacing(n, a) }));
-  y += 122;
-  ptext('2   POINT AT THE REAL SKY', 40, y, PF(700, 18), '#8190b0');
-  if (XR.mode === 'ar') {
+  if (XR.calibObj) {
+    const c = XR.calibObj;
+    ptext(`Look straight at the real ${c.name}.`, PW / 2, 320, PF(700, 36), '#f4b942', 'center');
+    ptext(`It is roughly ${compassLong(c.az)}, ${upPhrase(c.alt)}.`, PW / 2, 366, PF(500, 23), '#9aa7c4', 'center');
+    ptext('Centre it in the green circle, then pull the trigger or pinch.', PW / 2, 420, PF(600, 24), '#dfe5f3', 'center');
+    ptext('No controllers? Hold it there, still, for three seconds.', PW / 2, 456, PF(500, 21), '#9aa7c4', 'center');
+    cancel(); return;
+  }
+  let y = 300;
+  ptext('1   QUICK — FACE A DIRECTION YOU KNOW', 40, y, PF(700, 18), '#8190b0');
+  const sh = ar ? shadowAz() : null, n = sh == null ? 4 : 5, bw = n === 4 ? 220 : 179, gap = n === 4 ? 21 : 12;
+  [['North', 0], ['East', 90], ['South', 180], ['West', 270]].forEach(([nm, a], i) =>
+    pbtn('face-' + nm, nm, 40 + i * (bw + gap), y + 14, bw, 62, { act: () => startFacing(nm, a) }));
+  if (sh != null) pbtn('face-shadow', 'My shadow', 40 + 4 * (bw + gap), y + 14, bw, 62,
+    { act: () => startFacing('shadow', sh, 'Turn your back to the Sun and face straight along your shadow.') });
+  y += 118;
+  ptext('2   PRECISE — LOOK AT THE REAL MOON OR A BRIGHT PLANET', 40, y, PF(700, 18), '#8190b0');
+  if (ar) {
     const c = calibCandidates();
-    if (!c.length) ptext(atNow(() => SKY.sunAlt) > -4 ? 'By day only the Moon will do, and it is not up — use a direction instead.' : 'Nothing bright enough is up right now — use a direction instead.', 40, y + 52, PF(500, 22), '#9aa7c4');
-    c.forEach((k, i) => pbtn('obj-' + i, `${k.name} · ${COMPASS[Math.round(k.pos.az / 22.5) % 16]}`, 40 + i * 320, y + 16, 300, 66, { act: () => startObject(k.o, k.name) }));
-  } else ptext('Switch to mixed reality to aim at the real Moon or a bright star.', 40, y + 52, PF(500, 22), '#6b7799');
-  y += 122;
-  ptext('3   FINE-TUNE', 40, y, PF(700, 18), '#8190b0');
-  pwrap('Push the thumbstick left or right to turn the sky until a star you can see lines up exactly.', 700, PF(500, 22), 2)
-    .forEach((l, i) => ptext(l, 40, y + 40 + i * 30, PF(500, 22), '#dfe5f3'));
-  ptext(`${XR.theta >= 0 ? '+' : ''}${XR.theta.toFixed(1)}°`, PW - 40, y + 40, PT(26), '#f4b942', 'right');
-  pbtn('done', 'Done', PW - 260, PH - 100, 220, 70, { primary: true, act: () => { XR.screen = 'main'; XR.needPanel = true; } });
+    if (!c.length) ptext(atNow(() => SKY.sunAlt) > -4 ? `By day only the Moon will do, and it is not up — use ${sh != null ? 'your shadow' : 'a direction'} instead.`
+      : 'Nothing bright enough is up right now — use a direction instead.', 40, y + 50, PF(500, 22), '#9aa7c4');
+    c.forEach((k, i) => {
+      const done = XR.samples.some(s => s.label === (k.o.kind === 'moon' ? 'the Moon' : k.name));
+      pbtn('obj-' + i, `${done ? '✓ ' : ''}${k.name} · ${COMPASS[Math.round(k.pos.az / 22.5) % 16]}`, 40 + i * 320, y + 14, 300, 62, { on: done, act: () => startObject(k.o, k.name) });
+    });
+  } else ptext('Switch to mixed reality to line up on the real Moon or a bright planet.', 40, y + 50, PF(500, 22), '#6b7799');
+  y += 118;
+  ptext('3   EXACT — GRAB THE SKY', 40, y, PF(700, 18), '#8190b0');
+  ptext(`${XR.theta >= 0 ? '+' : ''}${XR.theta.toFixed(1)}°`, PW - 40, y + 2, PT(24), '#f4b942', 'right');
+  pwrap('Hold the trigger — or pinch — on the sky and sweep sideways, dragging a drawn star onto the real one. Or nudge it with the thumbstick.', 690, PF(500, 21), 3)
+    .forEach((l, i) => ptext(l, 40, y + 36 + i * 28, PF(500, 21), '#dfe5f3'));
+  pbtn('done', 'Done', PW - 250, PH - 96, 210, 66, { primary: true, act: calibDone });
 }
 function panelMain() {
   const o = XR.info;
@@ -936,8 +1147,8 @@ function panelMain() {
   pbtn('voice', 'Voice', 40 + 4 * (w + 12), y2, w, 62, { on: XR.voice, act: () => { XR.voice = !XR.voice; if (!XR.voice) try { speechSynthesis.cancel(); } catch (e) {} } });
   const y3 = 540;
   if (XR.mode === 'ar') {
-    ptext('DIM THE REAL WORLD', 40, y3 + 18, PF(700, 16), '#8190b0');
-    [[0, 'Off'], [0.35, '35%'], [0.65, '65%']].forEach(([v, t], i) => pbtn('dim' + i, t, 40 + i * 118, y3 + 30, 108, 56, { px: 22, on: XR.dim === v, act: () => { XR.dim = v; } }));
+    ptext('STAR BRIGHTNESS', 40, y3 + 18, PF(700, 16), '#8190b0');
+    [[1.45, 'Normal'], [2.2, 'Bright'], [3.2, 'Bold']].forEach(([v, t], i) => pbtn('boost' + i, t, 40 + i * 118, y3 + 30, 108, 56, { px: 22, on: XR.boost === v, act: () => { XR.boost = v; } }));
     ptext('STARS SHOWN', 420, y3 + 18, PF(700, 16), '#8190b0');
     [[3.2, 'Bright'], [4.8, 'More'], [6.0, 'All']].forEach(([v, t], i) => pbtn('lim' + i, t, 420 + i * 118, y3 + 30, 108, 56, { px: 22, on: XR.mrLimit === v, act: () => { XR.mrLimit = v; } }));
   }
